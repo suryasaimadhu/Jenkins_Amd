@@ -1,0 +1,799 @@
+
+
+// Jenkins file for LKP Regression Pipeline
+
+build_home="/tests/jenkins/openeuler/turin_patch/workspace/host_regression"
+node_name="9b0c_turin"
+ 
+BUILD_NUMBER="${env.BUILD_NUMBER}"
+ 
+pipeline {
+    agent {
+        node "${node_name}"
+    }
+    stages {
+        stage('Pipeline Init') {
+            steps {
+                script {
+                    if ( kernel_type.contains("git") ) {
+                      echo 'git'
+                      echo "${kernel_repo}"
+                      echo "${kernel_branch}"
+                      echo "${BUILD_NUMBER}"
+                    }
+                     else {
+                      echo 'none'
+                    }
+                }
+            }
+        }
+
+        stage('Install Host pre-req pkgs') {
+            steps {
+                echo 'Install Host pre-req pkgs - Host_preReqPkgInstall()'
+                script {
+                    echo 'skipping Host_preReqPkgInstall() '
+                    // Host_preReqPkgInstall()
+                }
+                
+            }
+        }
+
+        stage('git clone and checkout') {
+            steps {
+                echo 'clone git - cloneKernel'
+                script {
+                    cloneKernel()
+                }
+            }
+        }
+
+        stage('kernel build') {
+            steps {
+                echo 'Build Kernel'
+                script {
+                    buildKernel()
+                }
+            }
+        }
+
+        stage('Reboot with build kernel') {
+            steps {
+                echo 'Reboot Kernel'
+                script {
+                    RebootKernel()
+                }
+                
+            }
+        }
+
+        stage('Install workload pre-req pkgs') {
+            steps {
+                echo 'Sleep for 5 minutes before installing pre-requisites packages'
+                sleep time: 2, unit: 'SECONDS' // Sleep for 5 minutes
+                
+                script {
+                    // Add a loop to check if the system is back online
+                    boolean isSystemOnline = false
+                    int retries = 0
+                    env.host_ip = sh(script: "hostname -I |  cut -d ' ' -f1 ", returnStdout: true).trim()
+                    while (!isSystemOnline && retries < 12) {  // Check for 12 times with 30-second intervals (total 6 minutes)
+                        try {
+                            sh "ping -c 1 ${env.host_ip}" // Ping the system with IP address 10.138.173.0
+                            isSystemOnline = true
+                        } catch (Exception e) {
+                            echo "System is still rebooting... Retrying in 30 seconds..."
+                            sleep time: 30, unit: 'SECONDS'
+                            retries++
+                        }
+                    }
+
+                    echo 'Install pre-requisites packages for the workload - Workload_preReqPkgInstall()'
+                    // Workload_preReqPkgInstall()
+                }
+            }
+        }
+
+        stage('Install and run LKP') {
+            steps {
+                echo 'Install LKP '
+                script {
+                     runLKPTests_full()
+                } 
+            }
+        }
+
+        stage('Archive results') {
+            steps {
+                echo 'Archive result '
+                script {
+                    MyArchive()
+                }
+            }
+        }
+    }
+}
+ 
+void Host_preReqPkgInstall() {
+    echo "Inside - Host_preReqPkgInstall()"
+   
+    def packageManager = ''
+    def installCommands = []
+
+    try {
+        def host_distro_out = sh(script: "cat /etc/os-release", returnStdout: true).trim()
+        echo "${host_distro_out}"
+       
+        def idLine = host_distro_out.split("\n").find { it.startsWith("ID=") }
+        if (idLine) {
+            def distroId = idLine.split("=")[1].replaceAll(/"/, "").trim()
+            echo "Detected distribution ID: ${distroId}"
+           
+            switch(distroId) {
+                case ~/rhel.*/:
+                    packageManager = 'yum'
+                    installCommands = [
+                        'clean packages -y',
+                        'install -y sshpass ipmitool git make automake python3-rpm bc flex bison rpm lz4 kexec-tools libunwind-devel python3-devel slang-devel numactl-devel libbabeltrace-devel capstone-devel libpfm-devel libtraceevent-devel'
+                    ]
+                    break
+                case ~/ubuntu.*/:
+                    packageManager = 'apt'
+                    installCommands = [
+                        "install -y sshpass",
+                        "install -y git gcc make automake fakeroot build-essential ncurses-dev pkg-config",
+                        "install -y xz-utils libssl-dev libelf-dev bc flex bison rpm dwarves lz4 python3-rpm",
+                        "install -y software-properties-common"
+                    ]
+                    // TODO: Facing issues with kexec-tools install on a freshly installed OS, need to fix this
+                    // installCommands.add("install kexec-tools")
+                    break
+                case ~/openEuler.*/:
+                    packageManager = 'yum'
+                    installCommands = [
+                        'clean packages -y',
+                        'install -y sshpass ipmitool git make automake python3-rpm bc flex bison rpm lz4 kexec-tools libunwind-devel python3-devel slang-devel numactl-devel libbabeltrace-devel capstone-devel libpfm-devel libtraceevent-devel'
+                    ]
+                    break
+                case ~/anolis.*/:
+                    packageManager = 'yum'
+                    installCommands = [
+                        // "install sshpass -y",
+                        "install -y ipmitool",
+                        "install -y git make automake python3-rpm bc flex bison rpm lz4 libunwind-devel python3-devel slang-devel numactl-devel libbabeltrace-devel capstone-devel libpfm-devel libtraceevent-devel"
+                        // "install kexec-tools -y"
+                    ]
+                    break
+                case ~/opencloudos.*/:
+                    packageManager = 'yum'
+                    installCommands = [
+                        // "install sshpass -y",
+                        "install -y ipmitool",
+                        "install -y git make automake python3-rpm bc flex bison rpm lz4 libunwind-devel python3-devel slang-devel numactl-devel libbabeltrace-devel capstone-devel libpfm-devel libtraceevent-devel"
+                        // "install kexec-tools -y"
+                    ]
+                    break    
+                default:
+                    throw new Exception("Distro distribution on HOST not supported and sshpass not able to install")
+            }
+           
+            echo "Using package manager: ${packageManager}"
+            installCommands.each { command ->
+                echo "Executing command: ${packageManager} ${command}"
+                sh(script: "${packageManager} ${command}", returnStdout: false)
+            }
+        } else {
+            throw new Exception("Failed to retrieve distribution ID from /etc/os-release")
+        }
+    } catch(e) {
+        error("Error in determining supported distro and installing sshpass to system: ${e}")
+    }
+}
+
+void Workload_preReqPkgInstall() {
+    println "Install pre-requisites packages for the workload - Workload_preReqPkgInstall()"
+    println "Inside - Workload_preReqPkgInstall()"
+    
+    try {
+        def host_distro_out = sh(script: 'cat /etc/os-release | grep "^ID=" | awk -F "=" \'{print $2}\'', returnStdout: true).trim().replaceAll('"', '')
+        println "Host distribution: ${host_distro_out}"
+        
+        def distroCommands = [
+            rhel: ["yum clean packages -y", "yum install sshpass ipmitool -y", "yum install git make automake python3-rpm bc flex bison rpm lz4 -y", "yum install kexec-tools -y"],
+            ubuntu: ["apt --yes install sshpass", "apt --yes install git gcc make automake fakeroot build-essential ncurses-dev pkg-config xz-utils libssl-dev libelf-dev bc flex bison rpm lz4 python3-rpm", "apt-get --yes install software-properties-common"],
+            openEuler: ["yum clean packages -y", "yum install sshpass ipmitool -y", "yum install git make automake python3-rpm bc flex bison rpm lz4 -y", "yum install kexec-tools -y"],
+            anolis: ["yum clean packages -y", "yum install ipmitool -y", "yum install git make automake python3-rpm bc flex bison rpm lz4 -y"],
+            opencloudos: ["yum clean packages -y", "yum install ipmitool -y", "yum install git make automake python3-rpm bc flex bison rpm lz4 -y"]
+        ]
+
+        println "Host distribution: ${host_distro_out}"
+        
+        if (distroCommands.containsKey(host_distro_out)) {
+            def distroCommandsForHost = distroCommands[host_distro_out]
+            println "Commands for host: ${distroCommandsForHost}"
+            
+            distroCommandsForHost.each { command ->
+                sh(script: command, returnStdout: false)
+            }
+        } else {
+            throw new Exception("Distro distribution on the host is not supported, and sshpass installation failed.")
+        }
+    } catch(Exception e) {
+        error("Error in determining supported distro and installing sshpass: $e")
+    }
+}
+
+void runAvocadoMisctestsTests() {
+    echo "Inside - runAvocadoMisctestsTests()"
+    try{
+
+        sh """
+        rm -rf ${build_home}/execute_avocado.txt
+        echo 'mkdir -p ${build_home};cd ${build_home};' >> ${build_home}/execute_avocado.txt
+        chmod +x ${build_home}/execute_avocado.txt
+        echo 'git clone https://github.com/open-power-host-os/tests.git' >> ${build_home}/execute_avocado.txt
+        echo 'cd tests; chmod +x ./avocado-setup.py; ./avocado-setup.py --bootstrap --install-deps' >> ${build_home}/execute_avocado.txt
+        #Creating cpu,mem,io,fs,kernel,perf,ras test buckets under respective dirs
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/cpu/; find ./  -name \"*.py\"  > cpu_tests; chmod +x cpu_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/cpu/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" cpu_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/memory/; find ./  -name \"*.py\"  > memory_tests; chmod +x memory_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/memory/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" memory_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/io/; find ./  -name \"*.py\"  > io_tests; chmod +x io_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/io/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" io_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/fs/; find ./  -name \"*.py\"  > fs_tests; chmod +x fs_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/fs/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" fs_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/perf/; find ./  -name \"*.py\"  > perf_tests; chmod +x perf_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/perf/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" perf_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/kernel/; find ./  -name \"*.py\"  > kernel_tests; chmod +x kernel_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/kernel/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" kernel_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/ras/; find ./  -name \"*.py\"  > ras_tests; chmod +x ras_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/ras/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" ras_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/generic/; find ./  -name \"*.py\"  > generic_tests; chmod +x generic_tests ' >> ${build_home}/execute_avocado.txt
+        echo 'cd ${build_home}/tests/tests/avocado-misc-tests/generic/' >> ${build_home}/execute_avocado.txt
+        echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" generic_tests\" >>  ${build_home}/execute_avocado.txt
+ 
+ 
+        #echo 'cd ${build_home}/tests/tests/avocado-misc-tests/cpu/' >> ${build_home}/execute_avocado.txt
+        #echo \"sed -i \\\"s/^/ avocado run --max-parallel-tasks=1 /g \\\" cpu_tests\" >>  ${build_home}/execute_avocado.txt
+        echo 'which avocado; avocado -v ' >>  ${build_home}/execute_avocado.txt
+        """
+
+        // execute master script
+        sh(script:"cd  ${build_home}; ./execute_avocado.txt",returnStdout: false)
+        // runAvocadoMisctestsTests2()
+       // optest_execute("execute${AvocadoTests_src}")
+}catch(e){
+        failure_message = "Error Avocado-Misc-Tests setup and run" + e
+        error("Error Avocado-Misc-Tests setup and run: ${e}")
+    }
+ 
+}
+
+
+ 
+void runAvocadoMisctestsTests2() {
+    echo "Inside - runAvocadoMisctestsTests2()"
+    try{
+        if ( test_type.contains("cpu") ) {
+	    echo "cpu"
+        }
+        else if ( test_type.contains("memory") ) {
+	    echo "memory"
+        }
+        else if ( test_type.contains("io") ) {
+	    echo "io"
+        }
+        else if ( test_type.contains("ras") ) {
+	    echo "ras"
+        }
+        else if ( test_type.contains("fs") ) {
+	    echo "fs"
+        }
+        else if ( test_type.contains("generic") ) {
+	    echo "generic"
+        }
+        else if ( test_type.contains("kernel") ) {
+	    echo "kernel"
+	    echo "${BUILD_NUMBER}"
+	    // sh(script:"cd ${build_home}/tests/tests/avocado-misc-tests/kernel/; ./kernel_tests", returnStdout: false)
+        }
+        else if ( test_type.contains("perf") ) {
+	    echo "perf"
+        }
+    }
+    catch(e){
+         failure_message = "Error Avocado-Misc-Tests setup and run" + e
+         error("Error Avocado-Misc-Tests setup and run: ${e}")
+    }
+ 
+}
+ 
+void MyArchive() {
+    try {
+        // result_dir="${build_home}/${JOB_NAME}/${BUILD_NUMBER}"
+        result_dir="${build_home}/../${JOB_NAME}/${BUILD_NUMBER}"
+        echo "result_dir: ${result_dir}"
+        // archiveArtifacts  looks under result_dir for the artifacts. 
+
+        sh """
+        mkdir -p  ${result_dir}
+        
+        # Archieve hackbench run results
+        cp -r /lkp/result/hackbench  ${result_dir}/
+        
+        # Archieve ebizzy run results 
+        cp -r /lkp/result/ebizzy  ${result_dir}/
+        
+        # Archieve unixbench results
+         cp -r /lkp/result/unixbench  ${result_dir}/
+         
+        
+        """
+
+        archiveArtifacts artifacts: '**/*.html', followSymlinks: false, fingerprint: true, allowEmptyArchive: true
+    }
+    catch(e) {
+         failure_message = "Error Avocado-Misc-Tests archive" + e
+         error("Error Avocado-Misc-archive: ${e}")
+    }
+}
+
+ 
+void cloneKernel(){
+    echo "Inside - cloneKernel()"   
+    try{
+        if (kernel_type.contains("git")){
+            echo "Cloning GIT Kernel: ${kernel_repo}"
+            echo "Kernel Branch: ${kernel_branch}"
+            kernel_src = "kernel_src"
+
+            sh """
+            echo 'mkdir -p ${build_home}' >> ${build_home}/execute_clonekernel.txt
+            echo 'cd ${build_home}/; rm -rf ${kernel_src}/; git clone ${kernel_repo} ${kernel_src}' >> ${build_home}/execute_clonekernel.txt
+            echo 'cd ${build_home}/${kernel_src}; git checkout master; git reset --hard; git fetch --tags; git pull -p; git checkout ${kernel_branch}' >> ${build_home}/execute_clonekernel.txt
+            echo 'cd ${build_home}/${kernel_src}; git log -100 > git_log_100.txt' >> ${build_home}/execute_clonekernel.txt
+            chmod +x ${build_home}/execute_clonekernel.txt   
+            """    
+        } 
+    }   
+    catch(e){
+          failure_message = "Error cloning kernel: " + e
+          error("Error cloning kernel")
+    }
+}
+
+void buildKernel() {
+    echo "Inside - buildKernel()"
+    KERNEL_CONFIG_SUBCOMP="NONE"
+    try{
+        kernel_src="kernel_src"
+        time = "${currentBuild.startTimeInMillis}"
+        host_distro_out=sh(script:"cat /etc/os-release  | grep ^ID= | awk -F '=' '{print \$2}'", returnStdout: true).toString().trim()
+        echo "${host_distro_out}"
+        if ( host_distro_out.contains("rhel") || host_distro_out.contains("anolis") || host_distro_out.contains("openEuler") || host_distro_out.contains("opencloudos")){
+            echo "RHEL Distro"
+            if (kernel_type.contains("git")){
+
+                echo "Build and install kernel: ${kernel_repo}"
+                sh """
+                echo 'cd ${build_home}/${kernel_src}' >> ${build_home}/execute.txt
+                echo 'make clean' >> ${build_home}/execute.txt
+                echo 'kernel_version=`make kernelversion`' >> ${build_home}/execute.txt
+                echo 'cp -v /boot/config-\$(uname -r) .config || zcat /proc/config.gz > .config || wget http://sos-jenkins.amd.com/kernel-config/config -O .config' >> ${build_home}/execute.txt
+                echo 'sed -ri '/CONFIG_SYSTEM_TRUSTED_KEYS/s/=.+/=n/g' .config' >> ${build_home}/execute.txt
+                echo 'sed -ri '/CONFIG_MODULE_SIG_KEY/s/=.+/=n/g' .config' >> ${build_home}/execute.txt
+                echo 'sed -ri '/CONFIG_DEBUG_INFO_BTF/s/=.+/=y/g' .config\n' >> ${build_home}/execute.txt
+                echo 'sed -ri '/CONFIG_IKCONFIG/s/.+/CONFIG_IKCONFIG=y/g' .config' >> ${build_home}/execute.txt
+                echo 'sed -ri '/CONFIG_CRYPTO/s/=.+/=n/g' .config' >> ${build_home}/execute.txt
+                echo 'sed -ri \"s/# CONFIG_RCU_TORTURE_TEST is not set/CONFIG_RCU_TORTURE_TEST=m/g\" .config' >> ${build_home}/execute.txt
+                """ 
+
+                if (KERNEL_CONFIG_SUBCOMP == "memory"){
+
+                    sh """
+                    echo 'sed -ri \"s/# CONFIG_LOCK_STAT is not set/CONFIG_LOCK_STAT=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/CONFIG_DEBUG_RT_MUTEXES is not set/CONFIG_DEBUG_RT_MUTEXES=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/# CONFIG_DEBUG_SPINLOCK is not set/CONFIG_DEBUG_SPINLOCK=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/# CONFIG_DEBUG_MUTEXES is not set/CONFIG_DEBUG_MUTEXES=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_ZSMALLOC_STAT.*/CONFIG_ZSMALLOC_STAT=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE.*/CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*# CONFIG_CMA_SYSFS is not set.*/CONFIG_CMA_SYSFS=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_DEFERRED_STRUCT_PAGE_INIT.*/CONFIG_DEFERRED_STRUCT_PAGE_INIT=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_DAMON_SYSFS.*/CONFIG_DAMON_SYSFS=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_DAMON_LRU_SORT.*/CONFIG_DAMON_LRU_SORT=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/# CONFIG_LRU_GEN is not set/CONFIG_LRU_GEN=y/g\" .config' >> ${build_home}/execute.txt
+                    """
+ 
+                }
+                if (KERNEL_CONFIG_SUBCOMP == "perf"){
+
+                    sh """
+                    echo 'sed -ri \"s/.*CONFIG_PERF_EVENTS.*/CONFIG_PERF_EVENTS=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_PERF_EVENTS_AMD_BRS.*/CONFIG_PERF_EVENTS_AMD_BRS=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_PERF_EVENTS_AMD_POWER.*/CONFIG_PERF_EVENTS_AMD_POWER=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_PERF_EVENTS_AMD_UNCORE.*/CONFIG_PERF_EVENTS_AMD_UNCORE=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_CGROUP_PERF.*/CONFIG_CGROUP_PERF=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_ARCH_SUPPORTS_UPROBES.*/CONFIG_ARCH_SUPPORTS_UPROBES=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_UPROBE_EVENTS.*/CONFIG_UPROBE_EVENTS=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_HAVE_HW_BREAKPOINT.*/CONFIG_HAVE_HW_BREAKPOINT=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_GUEST_PERF_EVENTS.*/CONFIG_GUEST_PERF_EVENTS=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -ri \"s/.*CONFIG_EVENT_TRACING.*/CONFIG_EVENT_TRACING=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -i \"s/.*CONFIG_KPROBE_EVENTS.*/CONFIG_KPROBE_EVENTS=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -i \"s/.*CONFIG_KRETPROBES.*/CONFIG_KRETPROBES=y/g\" .config' >> ${build_home}/execute.txt
+                    echo 'sed -i \"s/.*CONFIG_OPTPROBES.*/CONFIG_OPTPROBES=y/g\" .config' >> ${build_home}/execute.txt
+                    """ 
+
+                }
+
+                sh """
+                echo 'kernel_version=\${kernel_version}-${time}' >> ${build_home}/execute.txt
+                echo 'echo \${kernel_version}' >> ${build_home}/execute.txt
+                echo 'yes \"\" | make -j `nproc` LOCALVERSION=-${time}' >> ${build_home}/execute.txt
+                echo 'make -C tools/perf/ ' >> ${build_home}/execute.txt
+                echo 'make INSTALL_MOD_STRIP=1 modules_install' >> ${build_home}/execute.txt
+                echo 'make install' >> ${build_home}/execute.txt
+                echo 'kernel_version=\$(ls /boot | grep ${time} | grep vmlinuz | head -1)' >> ${build_home}/execute.txt
+                echo 'kernel_default_index=\$(grubby --info ALL | grep \$kernel_version -B 1 | grep index= | sed 's/index=//' )' >> ${build_home}/execute.txt
+                echo 'sed -ri \"/^GRUB_DEFAULT/s/=.*/=\$kernel_default_index/g\" /etc/default/grub' >> ${build_home}/execute.txt
+                #echo 'sed -ri \"/^GRUB_CMDLINE_LINUX=/s/(\".*)(\")/\1 \${additional_kernel_parameters}\2/g\" /etc/default/grub' >> ${build_home}/execute.txt
+                echo 'grubby --set-default=/boot/\${kernel_version}' >> ${build_home}/execute.txt
+                echo 'grub2-mkconfig -o /boot/grub2/grub.cfg' >> ${build_home}/execute.txt
+                echo 'cat /etc/default/grub' >> ${build_home}/execute.txt
+                echo 'grubby --info ALL' >> ${build_home}/execute.txt
+                """
+            }
+            else if (kernel_type.contains("amdsos")){
+                echo "Build and install kernel: ${kernel_amdsos}"
+
+                sh """
+                echo 'cd ${build_home}/amdsoskernels' >> ${build_home}/execute.txt
+                echo 'wget http://sos-repos/sos-team-only/user_apps/rhel-${distro_version_max}/numatop-rhel-${distro_version_max}.tar.gz' >> ${build_home}/execute.txt
+                echo 'tar -xf numatop-rhel-${distro_version_max}.tar.gz -C /usr' >> ${build_home}/execute.txt
+                #echo 'distro_=\$(cat /etc/os-release | grep ^ID= | cut -d '\"' -f2)' >> ${build_home}/execute.txt
+                echo 'echo ${distro_}' >> ${build_home}/execute.txt
+                echo 'wget -r -nH -np -R \"index.html\" --cut-dirs=2 -A linux-tools*${distro_}-${distro_version_max}*  http://sos-repos/linux-tools/build${kernel_amdsos}/' >> ${build_home}/execute.txt
+                echo 'tar -xf linux-tools* -C /tmp' >> ${build_home}/execute.txt
+                echo 'yes | cp -rf -p /tmp/linux-tools*/. /usr/.' >> ${build_home}/execute.txt
+                echo 'rpm -ivh --nodeps --force kernel-*' >> ${build_home}/execute.txt
+                echo 'kernel_default_index=\$(grubby --info ALL | grep build${kernel_amdsos} -B 1 | grep index= | sed 's/index=//' );echo \${kernel_default_index}' >> ${build_home}/execute.txt
+                #echo 'kernel_version=\$(grubby --info ALL | grep build${kernel_amdsos} | grep kernel= | sed 's/kernel=//' | sed 's/\"//g' )' >> ${build_home}/execute.txt
+                echo 'kernel_version=\$(grubby --info ALL | grep build${kernel_amdsos} | grep kernel= | sed 's/kernel=//') ; kernel_version=\${kernel_version:1:-1} ; echo \${kernel_version}'>> ${build_home}/execute.txt
+                echo 'sed -ri \"/^GRUB_DEFAULT/s/=.*/=\$kernel_default_index/g\" /etc/default/grub' >> ${build_home}/execute.txt
+                echo 'grubby --set-default=\${kernel_version}' >> ${build_home}/execute.txt
+                echo 'grubby --default-kernel' >> ${build_home}/execute.txt
+                echo 'grub2-mkconfig -o /boot/grub2/grub' >> ${build_home}/execute.txt
+                """
+
+            }
+        }
+        else if (host_distro_out.contains("ubuntu")){
+            if (kernel_type.contains("git")){
+
+                sh """
+                echo 'cd ${build_home}/${kernel_src}' >> ${build_home}/execute.txt
+                echo 'make clean' >> ${build_home}/execute.txt
+                echo 'kernel_version=`make kernelversion`' >> ${build_home}/execute.txt
+                echo 'cp -v /boot/config-\$(uname -r) .config || zcat /proc/config.gz > .config || wget http://sos-jenkins.amd.com/kernel-config/config -O .config' >> ${build_home}/execute.txt
+                #echo 'make defconfig -O .config' >> ${build_home}/execute.txt
+                echo 'scripts/config --set-str MODULE_SIG_KEY \"\"' >> ${build_home}/execute.txt
+                echo 'scripts/config --set-str SYSTEM_TRUSTED_KEYS \"\"' >> ${build_home}/execute.txt
+                echo 'scripts/config --enable DEBUG_INFO_BTF' >> ${build_home}/execute.txt
+                echo 'scripts/config --disable SYSTEM_REVOCATION_KEYS' >> ${build_home}/execute.txt
+                echo 'scripts/config --disable SYSTEM_REVOCATION_LIST' >> ${build_home}/execute.txt
+                echo 'openssl req -x509 -newkey rsa:4096 -keyout certs/mycert.pem -out certs/mycert.pem -nodes -days 3650 -batch' >> ${build_home}/execute.txt
+                echo 'scripts/config --set-str SYSTEM_TRUSTED_KEYS \"certs/mycert.pem\"' >> ${build_home}/execute.txt
+                echo 'scripts/config --set-str MODULE_SIG_KEY \"certs/mycert.pem\"' >> ${build_home}/execute.txt
+                echo 'yes \"\" | make localmodconfig' >> ${build_home}/execute.txt
+                echo 'scripts/config --enable CONFIG_DM_SNAPSHOT' >> ${build_home}/execute.txt
+                echo 'scripts/config --enable CONFIG_XFS_FS' >> ${build_home}/execute.txt
+                echo 'scripts/config --module CONFIG_RCU_TORTURE_TEST' >> ${build_home}/execute.txt
+                """
+ 
+                if (KERNEL_CONFIG_SUBCOMP == "memory"){
+
+                    sh """
+                    echo 'scripts/config --enable CONFIG_LOCK_STAT' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_DEBUG_RT_MUTEXES' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_DEBUG_SPINLOCK' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_DEBUG_MUTEXES' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_ZSMALLOC_STAT' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_CMA_SYSFS' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_DEFERRED_STRUCT_PAGE_INIT' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_DAMON_SYSFS' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_DAMON_LRU_SORT' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_LRU_GEN' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_TEST_HMM' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_TEST_VMALLOC' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_GUP_TEST' >> ${build_home}/execute.txt
+                    """
+                }
+                if (KERNEL_CONFIG_SUBCOMP == "perf"){
+
+                    sh """
+                    echo 'scripts/config --enable CONFIG_PERF_EVENTS' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_PERF_EVENTS_AMD_BRS' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_PERF_EVENTS_AMD_POWER' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_PERF_EVENTS_AMD_UNCORE' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_CGROUP_PERF' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_ARCH_SUPPORTS_UPROBES' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_UPROBE_EVENTS' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_HAVE_HW_BREAKPOINT' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_GUEST_PERF_EVENTS' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_EVENT_TRACING' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_KPROBE_EVENTS' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_KRETPROBES' >> ${build_home}/execute.txt
+                    echo 'scripts/config --enable CONFIG_OPTPROBES' >> ${build_home}/execute.txt
+                    """
+                    
+                }
+                sh """
+                echo 'cat .config' >> ${build_home}/execute.txt
+                echo 'kernel_version=\${kernel_version}-${time}' >> ${build_home}/execute.txt
+                echo 'echo \${kernel_version}' >> ${build_home}/execute.txt
+                echo 'yes \"\" | make -j `nproc` LOCALVERSION=-${time}' >> ${build_home}/execute.txt
+                #echo 'make -C tools/perf/' >> ${build_home}/execute.txt
+                echo 'make INSTALL_MOD_STRIP=1 modules_install' >> ${build_home}/execute.txt
+                echo 'make install' >> ${build_home}/execute.txt
+                echo 'kernel_version=\$(ls /boot | grep ${time} | grep vmlinuz | head -1)' >> ${build_home}/execute.txt
+                echo 'update-grub2' >> ${build_home}/execute.txt
+                """
+            }
+            else if (kernel_type.contains("amdsos")){
+
+                echo "Build and install kernel: ${kernel_amdsos}"
+
+                sh """
+                echo 'cd ${build_home}/amdsoskernels' >> ${build_home}/execute.txt
+                echo 'wget http://sos-repos/sos-team-only/user_apps/ubuntu-${distro_version}/numatop-ubuntu-${distro_version}.tar.gz' >> ${build_home}/execute.txt
+                echo 'tar -xf numatop-ubuntu-${distro_version}.tar.gz -C /usr' >> ${build_home}/execute.txt
+                echo 'echo ${distro_}' >> ${build_home}/execute.txt
+                echo 'wget -r -nH -np -R \"index.html\" --cut-dirs=2 -A linux-tools*ubuntu-${distro_version}*  http://sos-repos/linux-tools/build${kernel_amdsos}/' >> ${build_home}/execute.txt
+                echo 'tar -xf linux-tools* -C /tmp' >> ${build_home}/execute.txt
+                echo 'yes | cp -rf -p /tmp/linux-tools*/. /usr/.' >> ${build_home}/execute.txt
+                #echo 'sed -ri \"/^GRUB_CMDLINE_LINUX=/s/(\".*)(\")/\1 ${additional_kernel_parameters}\2/g\" /etc/default/grub' >> ${build_home}/execute.txt
+                echo 'dpkg -i *.deb' >> ${build_home}/execute.txt
+                echo 'update-grub2' >> ${build_home}/execute.txt
+                """
+            }    
+        }
+        else{
+            throw new Exception("Distro distribution on SUT not supported")
+        }
+        sh """
+        #cat ${build_home}/execute.txt
+        # chmod +x ${build_home}/execute.txt
+        #./${build_home}/execute.txt
+        """
+        // sh(script:"cd ${build_home} ; python3 op-test --bmc-type     ${bmc_type}                   --bmc-ip  ${bmc_ip}            --bmc-username ${bmc_username}    --bmc-password ${bmc_password}             --bmc-usernameipmi ${bmc_usernameipmi}              --bmc-passwordipmi ${bmc_passwordipmi}              --host-ip ${host_ip}           --host-user ${host_user}                     --host-password ${host_password}                  --run testcases.RunHostTest.RunHostTest --machine-state OS  --host-cmd-file execute.txt ", returnStdout: false)
+        // optest_execute("execute")
+    }catch(e){
+        failure_message = "Error building/installing on resource node: " + e
+        error("Error building/installing on resource node: ${e}")
+    }
+}
+
+void RebootKernel() {
+    echo "In RebootKernel()"
+
+    try {
+        if (kernel_type.contains("git")) {
+            sh(script: "pwd ; uname -a", returnStdout: false)
+            //sh 'sudo shutdown -r +1 '
+
+            // Add a loop to check if the system is back online
+            boolean isSystemOnline = false
+            int retries = 0
+            env.host_ip = sh(script: "hostname -I |  cut -d ' ' -f1 ", returnStdout: true).trim()
+            while (!isSystemOnline && retries < 12) {  // Check for 12 times with 30-second intervals (total 6 minutes)
+                try {
+                    sh """
+                    echo "HostIP: ${host_ip}"
+                    ping -c 1 ${env.host_ip}
+                    """
+                    isSystemOnline = true
+                } catch (Exception e) {
+                    echo "System is still rebooting... Retrying in 30 seconds..."
+                    sleep time: 30, unit: 'SECONDS'
+                    retries++
+                }
+            }
+
+            if (isSystemOnline) {
+                echo "System is back online."
+            } else {
+                error "System did not come back online after reboot."
+            }
+
+        } else {
+            echo "NO reboot, since there is no new kernel build..."
+        }
+    } catch (Exception e) {
+        def failure_message = "Error building/installing on resource node: ${e}"
+        error "Error in rebooting node: ${e}"
+    }
+}
+
+void runLKPTests_sanity() {
+    echo "Inside - runLKPtests()"
+    try{
+
+        sh """
+        cd ${build_home}
+        # create workload clone script
+        echo 'git clone https://github.com/intel/lkp-tests.git' > ${build_home}/clone_lkp.sh
+        echo 'cd lkp-tests' >> ${build_home}/clone_lkp.sh
+        echo 'make install' >> ${build_home}/clone_lkp.sh
+        echo 'lkp install' >> ${build_home}/clone_lkp.sh 
+        chmod +x ${build_home}/clone_lkp.sh
+        # execute clone script
+        echo 'Installing LKP test suite'
+        #${build_home}/clone_lkp.sh
+        
+        # hackbench 
+        cd ${build_home}/lkp-tests
+        lkp split-job ./jobs/hackbench.yaml
+        lkp split-job ./jobs/hackbench-cpuset.yaml
+        #ls -l hack*yaml | grep -v cpuset | awk '{print "lkp install " \$9;}' | head -1 > execute_hackbench.sh
+        ls -l hack*yaml | grep -v cpuset | awk '{print "lkp run " \$9;}' | head -1 > execute_hackbench.sh
+        #ls -l hack*yaml | grep cpuset | awk '{print "lkp install " \$9;}' | head -1 >> execute_hackbench.sh
+        #ls -l hack*yaml | grep  cpuset | awk '{print "lkp run " \$9;}' | head -1 >>  execute_hackbench.sh
+        chmod +x execute_hackbench.sh
+     
+        # ebizzy 
+        cd ${build_home}/lkp-tests
+        lkp split-job ./jobs/ebizzy.yaml
+        #ls -l ebizzy*yaml | awk '{ print "lkp install " \$9;}' | head -1 >  execute_ebizzy.sh
+        ls -l ebizzy*yaml | awk '{ print "lkp run " \$9;}' >  execute_ebizzy.sh
+        chmod +x execute_ebizzy.sh
+        
+        # unixbench
+        cd ${build_home}/lkp-tests
+        lkp split-job ./jobs/unixbench.yaml
+        #ls -l unixbench*yaml | awk '{ print "lkp install " \$9;}' | head -1 >  execute_unixbench.sh
+        ls -l unixbench*yaml| awk '{ print "lkp run " \$9;}' | head -1 >  execute_unixbench.sh
+        chmod +x execute_unixbench.sh
+        
+        """
+
+        if ( workload_type.contains("hackbench") || workload_type.contains("all")) {
+            sh """
+            # cleanup previous run data
+            rm -rf  /lkp/result/hackbench/*
+            echo "running hackbench"
+            cd ${build_home}/lkp-tests
+            # ${build_home}/lkp-tests/execute_hackbench.sh
+            ${build_home}/lkp-tests/execute_hackbench.sh
+            
+            
+            """
+        }
+        if ( workload_type.contains("ebizzy") || workload_type.contains("all")) {
+            sh """
+            #cleanup previous run data
+            rm -rf  /lkp/result/ebizzy/*
+            echo "running ebizzy"
+            cd ${build_home}/lkp-tests
+            ${build_home}/lkp-tests/execute_ebizzy.sh
+            
+            """
+        }
+        if ( workload_type.contains("unixbench") || workload_type.contains("all")) {
+            sh """
+            # cleanup previous run data
+            rm -rf  /lkp/result/unixbench/*
+            echo "running unixbench"
+            cd ${build_home}/lkp-tests
+            ${build_home}/lkp-tests/execute_unixbench.sh
+            
+            """
+        }
+
+        
+}catch(e){
+        failure_message = "Error LKP tests setup and run" + e
+        error("Error LKP -Tests setup and run: ${e}")
+    }
+ 
+}
+
+void runLKPTests_full() {
+    echo "Inside - runLKPtests()"
+    try{
+
+        sh """
+        cd ${build_home}
+        # create workload clone script
+        echo 'git clone https://github.com/intel/lkp-tests.git' > ${build_home}/clone_lkp.sh
+        echo 'cd lkp-tests' >> ${build_home}/clone_lkp.sh
+        echo 'make install' >> ${build_home}/clone_lkp.sh
+        echo 'lkp install' >> ${build_home}/clone_lkp.sh 
+        chmod +x ${build_home}/clone_lkp.sh
+        # execute clone script
+        # echo 'Installing LKP test suite'
+        # ${build_home}/clone_lkp.sh
+        
+        # hackbench 
+        cd ${build_home}/lkp-tests
+        lkp split-job ./jobs/hackbench.yaml
+        lkp split-job ./jobs/hackbench-cpuset.yaml
+        #ls -l hack*yaml | grep -v cpuset | awk '{print "lkp install " \$9;}' | head -1 > execute_hackbench.sh
+        ls -l hack*yaml | grep -v cpuset | awk '{print "lkp run " \$9;}' | grep -v 1600 > execute_hackbench.sh
+        #ls -l hack*yaml | grep cpuset | awk '{print "lkp install " \$9;}' | head -1 >> execute_hackbench.sh
+        #ls -l hack*yaml | grep  cpuset | awk '{print "lkp run " \$9;}' | head -1 >>  execute_hackbench.sh
+        chmod +x execute_hackbench.sh
+     
+        # ebizzy 
+        cd ${build_home}/lkp-tests
+        lkp split-job ./jobs/ebizzy.yaml
+        #ls -l ebizzy*yaml | awk '{ print "lkp install " \$9;}' | head -1 >  execute_ebizzy.sh
+        ls -l ebizzy*yaml | awk '{ print "lkp run " \$9;}' >  execute_ebizzy.sh
+        chmod +x execute_ebizzy.sh
+        
+        # unixbench
+        cd ${build_home}/lkp-tests
+        lkp split-job ./jobs/unixbench.yaml
+        #ls -l unixbench*yaml | awk '{ print "lkp install " \$9;}' | head -1 >  execute_unixbench.sh
+        ls -l unixbench*yaml| awk '{ print "lkp run " \$9;}' >  execute_unixbench.sh
+        chmod +x execute_unixbench.sh
+        
+        """
+
+        if ( workload_type.contains("hackbench") || workload_type.contains("all")) {
+            sh """
+            # cleanup previous run data
+            rm -rf  /lkp/result/hackbench/*
+            echo "running hackbench"
+            cd ${build_home}/lkp-tests
+            # ${build_home}/lkp-tests/execute_hackbench.sh
+            ${build_home}/lkp-tests/execute_hackbench.sh
+
+            
+            """
+        }
+        if ( workload_type.contains("ebizzy") || workload_type.contains("all")) {
+            sh """
+            #cleanup previous run data
+            rm -rf  /lkp/result/ebizzy/*
+            echo "running ebizzy"
+            cd ${build_home}/lkp-tests
+            ${build_home}/lkp-tests/execute_ebizzy.sh
+            
+            """
+        }
+        if ( workload_type.contains("unixbench") || workload_type.contains("all")) {
+            sh """
+            # cleanup previous run data
+            rm -rf  /lkp/result/unixbench/*
+            echo "running unixbench"
+            cd ${build_home}/lkp-tests
+            ${build_home}/lkp-tests/execute_unixbench.sh
+            
+            """
+        }
+
+        
+}catch(e){
+        failure_message = "Error LKP tests setup and run" + e
+        error("Error LKP -Tests setup and run: ${e}")
+    }
+ 
+}
+
+
+
+

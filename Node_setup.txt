@@ -1,0 +1,17 @@
+Remote root directory:
+provide the path /**
+
+Launch Method:
+launch by agent via ssh
+
+host:
+ip:*****
+
+Credentials:
+**password
+
+Host key verification strategy:
+Non verifying verification Strategy.
+
+Availability:
+keep the agent online as much as possible.
